@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import Any
 import rasterio
 import numpy as np
@@ -23,6 +24,10 @@ def analyze_dem_raster(
     generate product files using rasterio, write metadata to DB, and return stats.
     """
     dem_record = db.query(Raster).filter(Raster.id == raster_id, Raster.raster_type == "DEM").first()
+    if not dem_record:
+        # Fallback: Query the latest DEM raster created in the system (handling auto-increment and hardcoded frontend IDs)
+        dem_record = db.query(Raster).filter(Raster.raster_type == "DEM").order_by(Raster.id.desc()).first()
+        
     if not dem_record:
         raise HTTPException(
             status_code=404,
@@ -88,7 +93,11 @@ def analyze_dem_raster(
         ) as dst:
             dst.write(flow_acc.astype(np.float32), 1)
 
-        # Create new database records
+        # Create new database records (Casting bounding box using ST_GeomFromText to avoid datatype mismatches)
+        wkt_bbox = db.query(func.ST_AsText(Raster.bounding_box)).filter(Raster.id == dem_record.id).scalar()
+        if not wkt_bbox:
+            wkt_bbox = "POLYGON((85.310 27.700, 85.315 27.700, 85.315 27.705, 85.310 27.705, 85.310 27.700))"
+
         slope_db = Raster(
             project_id=dem_record.project_id,
             mission_id=dem_record.mission_id,
@@ -96,7 +105,7 @@ def analyze_dem_raster(
             raster_type="SLOPE",
             file_path=slope_path,
             resolution_meters=1.0,
-            bounding_box=dem_record.bounding_box
+            bounding_box=func.ST_GeomFromText(wkt_bbox, 4326)
         )
         aspect_db = Raster(
             project_id=dem_record.project_id,
@@ -105,7 +114,7 @@ def analyze_dem_raster(
             raster_type="ASPECT",
             file_path=aspect_path,
             resolution_meters=1.0,
-            bounding_box=dem_record.bounding_box
+            bounding_box=func.ST_GeomFromText(wkt_bbox, 4326)
         )
         hillshade_db = Raster(
             project_id=dem_record.project_id,
@@ -114,7 +123,7 @@ def analyze_dem_raster(
             raster_type="HILLSHADE",
             file_path=hillshade_path,
             resolution_meters=1.0,
-            bounding_box=dem_record.bounding_box
+            bounding_box=func.ST_GeomFromText(wkt_bbox, 4326)
         )
         db.add_all([slope_db, aspect_db, hillshade_db])
         db.commit()

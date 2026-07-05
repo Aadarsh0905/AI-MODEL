@@ -3,12 +3,20 @@ from sqlalchemy.orm import Session
 from typing import Any, Dict, List
 import os
 import psutil
+import torch
+from pydantic import BaseModel
 
 from app.core.database import get_db
 from app.core.config import settings
 from app.api import deps
 from app.models.models import Report, PerformanceLog, User
 from app.services.reporting_decision import DecisionSupportService, ReportingService
+
+class ReportCreateRequest(BaseModel):
+    project_id: int
+    mission_id: int
+    title: str
+    table_data_json: List[List[str]]
 
 router = APIRouter()
 
@@ -33,18 +41,21 @@ def run_hazard_evaluation(
 
 @router.post("/reports/create-mission-pdf")
 def create_mission_pdf_report(
-    project_id: int,
-    mission_id: int,
-    title: str,
-    table_data_json: List[List[str]],
+    report_in: ReportCreateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(deps.get_current_user)
 ) -> Any:
     """
     Generate structural PDF document summary with institutional signature lines.
     """
+    project_id = report_in.project_id
+    mission_id = report_in.mission_id
+    title = report_in.title
+    table_data_json = report_in.table_data_json
+
     filename = f"report_project_{project_id}_m_{mission_id}_{int(psutil.time.time())}.pdf"
     filepath = os.path.join(settings.STORAGE_DIR, "reports", filename)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
     metadata = {
         "Project ID": str(project_id),

@@ -11,6 +11,7 @@ class NavigationService:
         self.roll = 0.0
         self.yaw = 0.0
         self.state = "LANDED"  # LANDED, TAKING_OFF, WAYPOINT, RTL, LANDING, EMERGENCY
+        self.battery_percentage = 100.0
         
         # SLAM variables
         self.position_uncertainty_m = 0.02  # RTK GNSS initially
@@ -43,9 +44,10 @@ class NavigationService:
         dz = target_alt - self.altitude
 
         dist_target = math.sqrt(dx**2 + dy**2 + dz**2)
+        step_dist = speed_mps * dt_seconds
 
-        if dist_target < 0.5:
-            # Reached target
+        if dist_target <= step_dist or dist_target < 0.5:
+            # Reached target, snap exactly to coordinates
             self.latitude = target_lat
             self.longitude = target_lon
             self.altitude = target_alt
@@ -115,9 +117,13 @@ class NavigationService:
         self.longitude = new_lon
         self.altitude = new_alt
 
-        # Update yaw based on travel direction
-        self.yaw = math.degrees(math.atan2(new_dx, new_dy)) % 360.0
-        self.pitch = math.degrees(math.atan2(new_dz, math.sqrt(new_dx**2 + new_dy**2)))
+        # Update yaw based on travel direction (only if actually moving horizontally)
+        if abs(new_dx) > 1e-7 or abs(new_dy) > 1e-7:
+            self.yaw = math.degrees(math.atan2(new_dx, new_dy)) % 360.0
+            self.pitch = math.degrees(math.atan2(new_dz, math.sqrt(new_dx**2 + new_dy**2)))
+        elif abs(new_dz) > 1e-7:
+            # Moving vertically only, pitch is 90 (up) or -90 (down), yaw remains unchanged
+            self.pitch = 90.0 if new_dz > 0 else -90.0
         self.roll = 0.0  # Bank angle could be modelled but keeping simple for telemetry
 
         # Update SLAM uncertainty

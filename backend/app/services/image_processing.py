@@ -80,30 +80,28 @@ class ImageProcessingService:
         )
 
         # Generate synthetic orthomosaic (multi-band RGB image with river geomorphic features)
+        y_indices, x_indices = np.ogrid[:height, :width]
+        river_centers = (width / 2.0 + 100.0 * np.sin(2.0 * np.pi * y_indices / height)).astype(np.int32)
+        dist_to_river = np.abs(x_indices - river_centers)
+
         ortho_data = np.zeros((3, height, width), dtype=np.uint8)
-        # Red band: high in dry areas
-        # Green band: high in vegetation
-        # Blue band: high in rivers
-        # Let's paint a river winding diagonally across the area
-        for y in range(height):
-            for x in range(width):
-                river_center = int(width / 2.0 + 100.0 * np.sin(2.0 * np.pi * y / height))
-                dist_to_river = abs(x - river_center)
-                if dist_to_river < 30:
-                    # Water (Deep Blue)
-                    ortho_data[0, y, x] = 10
-                    ortho_data[1, y, x] = 50
-                    ortho_data[2, y, x] = 220
-                elif dist_to_river < 60:
-                    # Riparian zone (Vegetation Green)
-                    ortho_data[0, y, x] = 40
-                    ortho_data[1, y, x] = 180
-                    ortho_data[2, y, x] = 40
-                else:
-                    # Soil (Brownish Red)
-                    ortho_data[0, y, x] = 160
-                    ortho_data[1, y, x] = 120
-                    ortho_data[2, y, x] = 90
+        
+        # Soil (Brownish Red) - default
+        ortho_data[0, :, :] = 160
+        ortho_data[1, :, :] = 120
+        ortho_data[2, :, :] = 90
+        
+        # Riparian zone (Vegetation Green) where 30 <= dist < 60
+        riparian_mask = (dist_to_river >= 30) & (dist_to_river < 60)
+        ortho_data[0, riparian_mask] = 40
+        ortho_data[1, riparian_mask] = 180
+        ortho_data[2, riparian_mask] = 40
+        
+        # Water (Deep Blue) where dist < 30
+        water_mask = dist_to_river < 30
+        ortho_data[0, water_mask] = 10
+        ortho_data[1, water_mask] = 50
+        ortho_data[2, water_mask] = 220
 
         # Save Orthomosaic TIF
         with rasterio.open(
@@ -120,14 +118,8 @@ class ImageProcessingService:
             dst.write(ortho_data)
 
         # Generate synthetic DEM (Digital Elevation Model with central river valley and high hills)
-        dem_data = np.zeros((height, width), dtype=np.float32)
-        for y in range(height):
-            for x in range(width):
-                river_center = int(width / 2.0 + 100.0 * np.sin(2.0 * np.pi * y / height))
-                dist_to_river = abs(x - river_center)
-                # Elevation increases as we move away from the river valley center
-                elevation = 100.0 + (dist_to_river * 0.5) - (y * 0.05) + (5.0 * np.sin(x / 20.0))
-                dem_data[y, x] = max(0.0, float(elevation))
+        elevation = 100.0 + (dist_to_river * 0.5) - (y_indices * 0.05) + (5.0 * np.sin(x_indices / 20.0))
+        dem_data = np.maximum(0.0, elevation).astype(np.float32)
 
         # Save DEM TIF
         with rasterio.open(
@@ -169,6 +161,33 @@ class ImageProcessingService:
             transform=transform,
         ) as dst:
             dst.write(dsm_data, 1)
+
+        # Generate PNG previews for web browser viewing
+        try:
+            # 1. Orthomosaic BGR preview
+            ortho_bgr = cv2.cvtColor(np.transpose(ortho_data, (1, 2, 0)), cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_dir, "orthomosaic_preview.png"), ortho_bgr)
+
+            # 2. DEM Colormap terrain preview (Using JET as TERRAIN is not standard in cv2)
+            dem_min, dem_max = dem_data.min(), dem_data.max()
+            if dem_max > dem_min:
+                dem_norm = ((dem_data - dem_min) / (dem_max - dem_min) * 255.0).astype(np.uint8)
+            else:
+                dem_norm = np.zeros_like(dem_data, dtype=np.uint8)
+            dem_colored = cv2.applyColorMap(dem_norm, cv2.COLORMAP_JET)
+            cv2.imwrite(os.path.join(output_dir, "dem_preview.png"), dem_colored)
+
+            # 3. DSM Colormap viridis preview
+            dsm_min, dsm_max = dsm_data.min(), dsm_data.max()
+            if dsm_max > dsm_min:
+                dsm_norm = ((dsm_data - dsm_min) / (dsm_max - dsm_min) * 255.0).astype(np.uint8)
+            else:
+                dsm_norm = np.zeros_like(dsm_data, dtype=np.uint8)
+            dsm_colored = cv2.applyColorMap(dsm_norm, cv2.COLORMAP_VIRIDIS)
+            cv2.imwrite(os.path.join(output_dir, "dsm_preview.png"), dsm_colored)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
         return {
             "orthomosaic": ortho_path,

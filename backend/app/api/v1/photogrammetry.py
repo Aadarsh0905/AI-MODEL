@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import Any
 import os
 
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.core.config import settings
 from app.api import deps
 from app.models.models import Mission, Image, Raster, User
@@ -74,14 +75,15 @@ def run_photogrammetry_background(mission_id: int, db_session_factory):
                 raster_type=r_type.upper(),
                 file_path=f_path,
                 resolution_meters=0.05,  # 5cm grid size
-                bounding_box=wkt_bbox
+                bounding_box=func.ST_GeomFromText(wkt_bbox, 4326)
             )
             db.add(db_raster)
         
         db.commit()
 
     except Exception as e:
-        pass
+        import traceback
+        traceback.print_exc()
     finally:
         db.close()
 

@@ -1,6 +1,7 @@
 import asyncio
+import json
 from datetime import datetime, timezone
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, BackgroundTasks
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 from typing import Any
 
@@ -16,6 +17,7 @@ router = APIRouter()
 
 # Global dict of active simulation tasks to allow cancellations/RTL triggers
 active_simulations = {}
+active_navigations = {}
 
 async def run_uav_simulation(mission_id: int, db_session_factory):
     """
@@ -45,7 +47,9 @@ async def run_uav_simulation(mission_id: int, db_session_factory):
         nav = NavigationService(float(start_wp.latitude), float(start_wp.longitude), 0.0)
         nav.state = "TAKING_OFF"
         
-        battery_pct = 100.0
+        # Register navigation globally for real-time charge access
+        active_navigations[mission_id] = nav
+        
         dt = 0.5  # simulation step interval (s)
         
         # 1. Auto Takeoff Phase
@@ -53,7 +57,7 @@ async def run_uav_simulation(mission_id: int, db_session_factory):
         while nav.altitude < target_alt:
             nav.altitude += 2.0  # Climb rate 2m/s
             nav.altitude = min(nav.altitude, target_alt)
-            battery_pct -= 0.1
+            nav.battery_percentage -= 0.1
             
             telemetry_data = {
                 "mission_id": mission_id,
@@ -64,34 +68,137 @@ async def run_uav_simulation(mission_id: int, db_session_factory):
                 "pitch": 5.0, # nose up
                 "roll": 0.0,
                 "yaw": nav.yaw,
-                "battery_percentage": max(0.0, battery_pct),
+                "battery_percentage": max(0.0, nav.battery_percentage),
                 "state": "TAKING_OFF"
             }
             await telemetry_manager.broadcast(telemetry_data)
             await asyncio.sleep(dt)
+            if nav.battery_percentage <= 0.0:
+                break
 
         # 2. Cruise / Waypoint execution phase
-        nav.state = "WAYPOINT"
-        for wp in waypoints:
-            wp_lat, wp_lon, wp_alt = float(wp.latitude), float(wp.longitude), float(wp.altitude)
-            
-            # Update database waypoint status to ACTIVE
-            wp.status = "ACTIVE"
-            db.commit()
-
-            # Fly towards waypoint
-            while True:
-                # Basic potential field with empty obstacles for simulator base
-                curr_lat, curr_lon, curr_alt = nav.update_position(
-                    target_lat=wp_lat,
-                    target_lon=wp_lon,
-                    target_alt=wp_alt,
-                    speed_mps=float(wp.speed),
-                    dt_seconds=dt
-                )
+        if nav.battery_percentage > 0.0:
+            nav.state = "WAYPOINT"
+            for wp in waypoints:
+                wp_lat, wp_lon, wp_alt = float(wp.latitude), float(wp.longitude), float(wp.altitude)
                 
-                battery_pct -= 0.05
-                telemetry_data = {
+                # Update database waypoint status to ACTIVE
+                wp.status = "ACTIVE"
+                db.commit()
+
+                # Fly towards waypoint
+                while True:
+                    # Basic potential field with empty obstacles for simulator base
+                    curr_lat, curr_lon, curr_alt = nav.update_position(
+                        target_lat=wp_lat,
+                        target_lon=wp_lon,
+                        target_alt=wp_alt,
+                        speed_mps=float(wp.speed),
+                        dt_seconds=dt
+                    )
+                    
+                    nav.battery_percentage -= 0.05
+                    telemetry_data = {
+                        "mission_id": mission_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "latitude": curr_lat,
+                        "longitude": curr_lon,
+                        "altitude": curr_alt,
+                        "pitch": nav.pitch,
+                        "roll": nav.roll,
+                        "yaw": nav.yaw,
+                        "battery_percentage": max(0.0, nav.battery_percentage),
+                        "state": nav.state
+                    }
+                    
+                    # Write to database (decimated log frequency to avoid db bloat)
+                    log = TelemetryLog(
+                        mission_id=mission_id,
+                        timestamp=datetime.now(timezone.utc),
+                        latitude=curr_lat,
+                        longitude=curr_lon,
+                        altitude=curr_alt,
+                        pitch=nav.pitch,
+                        roll=nav.roll,
+                        yaw=nav.yaw,
+                        battery_percentage=max(0.0, nav.battery_percentage),
+                        airspeed=wp.speed,
+                        groundspeed=wp.speed
+                    )
+                    db.add(log)
+                    db.commit()
+
+                    # Broadcast live update
+                    await telemetry_manager.broadcast(telemetry_data)
+
+                    # Check if waypoint reached
+                    if abs(nav.latitude - wp_lat) < 0.00001 and abs(nav.longitude - wp_lon) < 0.00001:
+                        break
+                    
+                    await asyncio.sleep(dt)
+                    if nav.battery_percentage <= 0.0:
+                        break
+
+                if nav.battery_percentage <= 0.0:
+                    break
+
+                # Reached waypoint -> Trigger payload scan
+                wp.status = "COMPLETED"
+                db.commit()
+
+                # Perform sensor captures
+                if wp.sequence % 4 == 0:
+                    # Capture LiDAR
+                    meta = sensor_service.capture_lidar(mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude)
+                elif wp.sequence % 3 == 0:
+                    # Capture Thermal
+                    meta = sensor_service.capture_thermal(mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude)
+                elif wp.sequence % 2 == 0:
+                    # Capture Multispectral
+                    meta = sensor_service.capture_multispectral(mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude)
+                else:
+                    # Capture standard RGB image
+                    meta = sensor_service.capture_rgb(
+                        mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude,
+                        nav.pitch, nav.roll, nav.yaw
+                    )
+                    
+                    # Insert RGB record into PostgreSQL
+                    db_image = Image(
+                        mission_id=mission_id,
+                        filename=meta["filename"],
+                        filepath=meta["filepath"],
+                        sensor="RGB",
+                        latitude=meta["latitude"],
+                        longitude=meta["longitude"],
+                        altitude=meta["altitude"],
+                        yaw=meta["yaw"],
+                        pitch=meta["pitch"],
+                        roll=meta["roll"],
+                        captured_at=datetime.fromisoformat(meta["captured_at"])
+                    )
+                    db.add(db_image)
+                    db.commit()
+
+                # Broadcast capture alert to frontend
+                await telemetry_manager.broadcast({
+                    "type": "CAPTURE_ALERT",
+                    "mission_id": mission_id,
+                    "sensor": meta["sensor"],
+                    "filename": meta["filename"],
+                    "lat": nav.latitude,
+                    "lon": nav.longitude
+                })
+
+        # 3. Return to Launch (RTL) Phase
+        if nav.battery_percentage > 0.0:
+            nav.state = "RTL"
+            home_lat, home_lon, home_alt = float(start_wp.latitude), float(start_wp.longitude), float(start_wp.altitude)
+            while True:
+                curr_lat, curr_lon, curr_alt = nav.update_position(home_lat, home_lon, home_alt, 8.0, dt)
+                nav.battery_percentage -= 0.05
+                
+                await telemetry_manager.broadcast({
                     "mission_id": mission_id,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "latitude": curr_lat,
@@ -100,106 +207,14 @@ async def run_uav_simulation(mission_id: int, db_session_factory):
                     "pitch": nav.pitch,
                     "roll": nav.roll,
                     "yaw": nav.yaw,
-                    "battery_percentage": max(0.0, battery_pct),
-                    "state": nav.state
-                }
-                
-                # Write to database (decimated log frequency to avoid db bloat)
-                log = TelemetryLog(
-                    mission_id=mission_id,
-                    timestamp=datetime.now(timezone.utc),
-                    latitude=curr_lat,
-                    longitude=curr_lon,
-                    altitude=curr_alt,
-                    pitch=nav.pitch,
-                    roll=nav.roll,
-                    yaw=nav.yaw,
-                    battery_percentage=max(0.0, battery_pct),
-                    airspeed=wp.speed,
-                    groundspeed=wp.speed
-                )
-                db.add(log)
-                db.commit()
-
-                # Broadcast live update
-                await telemetry_manager.broadcast(telemetry_data)
-
-                # Check if waypoint reached
-                dist = nav.update_position(wp_lat, wp_lon, wp_alt, 0.0, dt)
-                if abs(nav.latitude - wp_lat) < 0.00001 and abs(nav.longitude - wp_lon) < 0.00001:
+                    "battery_percentage": max(0.0, nav.battery_percentage),
+                    "state": "RTL"
+                })
+                if abs(nav.latitude - home_lat) < 0.00002 and abs(nav.longitude - home_lon) < 0.00002:
                     break
-                
                 await asyncio.sleep(dt)
-
-            # Reached waypoint -> Trigger payload scan
-            wp.status = "COMPLETED"
-            db.commit()
-
-            # Perform sensor captures
-            if wp.sequence % 4 == 0:
-                # Capture LiDAR
-                meta = sensor_service.capture_lidar(mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude)
-            elif wp.sequence % 3 == 0:
-                # Capture Thermal
-                meta = sensor_service.capture_thermal(mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude)
-            elif wp.sequence % 2 == 0:
-                # Capture Multispectral
-                meta = sensor_service.capture_multispectral(mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude)
-            else:
-                # Capture standard RGB image
-                meta = sensor_service.capture_rgb(
-                    mission_id, wp.sequence, nav.latitude, nav.longitude, nav.altitude,
-                    nav.pitch, nav.roll, nav.yaw
-                )
-                
-                # Insert RGB record into PostgreSQL
-                db_image = Image(
-                    mission_id=mission_id,
-                    filename=meta["filename"],
-                    filepath=meta["filepath"],
-                    sensor="RGB",
-                    latitude=meta["latitude"],
-                    longitude=meta["longitude"],
-                    altitude=meta["altitude"],
-                    yaw=meta["yaw"],
-                    pitch=meta["pitch"],
-                    roll=meta["roll"],
-                    captured_at=datetime.fromisoformat(meta["captured_at"])
-                )
-                db.add(db_image)
-                db.commit()
-
-            # Broadcast capture alert to frontend
-            await telemetry_manager.broadcast({
-                "type": "CAPTURE_ALERT",
-                "sensor": meta["sensor"],
-                "filename": meta["filename"],
-                "lat": nav.latitude,
-                "lon": nav.longitude
-            })
-
-        # 3. Return to Launch (RTL) Phase
-        nav.state = "RTL"
-        home_lat, home_lon, home_alt = float(start_wp.latitude), float(start_wp.longitude), float(start_wp.altitude)
-        while True:
-            curr_lat, curr_lon, curr_alt = nav.update_position(home_lat, home_lon, home_alt, 8.0, dt)
-            battery_pct -= 0.05
-            
-            await telemetry_manager.broadcast({
-                "mission_id": mission_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "latitude": curr_lat,
-                "longitude": curr_lon,
-                "altitude": curr_alt,
-                "pitch": nav.pitch,
-                "roll": nav.roll,
-                "yaw": nav.yaw,
-                "battery_percentage": max(0.0, battery_pct),
-                "state": "RTL"
-            })
-            if abs(nav.latitude - home_lat) < 0.00002 and abs(nav.longitude - home_lon) < 0.00002:
-                break
-            await asyncio.sleep(dt)
+                if nav.battery_percentage <= 0.0:
+                    break
 
         # 4. Auto Land Phase
         nav.state = "LANDING"
@@ -216,13 +231,13 @@ async def run_uav_simulation(mission_id: int, db_session_factory):
                 "pitch": -5.0,
                 "roll": 0.0,
                 "yaw": nav.yaw,
-                "battery_percentage": max(0.0, battery_pct),
+                "battery_percentage": max(0.0, nav.battery_percentage),
                 "state": "LANDING"
             })
             await asyncio.sleep(dt)
 
         mission.status = "COMPLETED"
-        mission.battery_used_percentage = round(100.0 - battery_pct, 2)
+        mission.battery_used_percentage = round(100.0 - nav.battery_percentage, 2)
         db.commit()
 
         await telemetry_manager.broadcast({
@@ -238,10 +253,11 @@ async def run_uav_simulation(mission_id: int, db_session_factory):
             db.commit()
     finally:
         db.close()
+        active_navigations.pop(mission_id, None)
         active_simulations.pop(mission_id, None)
 
 @router.post("/{mission_id}/start")
-def start_mission_telemetry(
+async def start_mission_telemetry(
     mission_id: int,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
@@ -257,9 +273,16 @@ def start_mission_telemetry(
     if mission_id in active_simulations:
         return {"status": "already_running"}
 
-    # Run in background loop
-    loop = asyncio.get_event_loop()
-    task = loop.create_task(run_uav_simulation(mission_id, SessionLocal))
+    # Cancel any other running simulations to prevent concurrent flight loop conflicts
+    for m_id, active_task in list(active_simulations.items()):
+        try:
+            active_task.cancel()
+        except Exception:
+            pass
+        active_simulations.pop(m_id, None)
+    
+    # Run in background task using asyncio.create_task
+    task = asyncio.create_task(run_uav_simulation(mission_id, SessionLocal))
     active_simulations[mission_id] = task
 
     return {"status": "started"}
@@ -291,3 +314,18 @@ async def websocket_telemetry_endpoint(websocket: WebSocket):
                 })
     except WebSocketDisconnect:
         telemetry_manager.disconnect(websocket)
+
+@router.post("/{mission_id}/charge")
+async def charge_drone_battery(
+    mission_id: int,
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    """
+    Instantly charges the active drone battery to 100%.
+    """
+    print(f"DEBUG CHARGE: mission_id={mission_id} (type={type(mission_id)})")
+    print(f"DEBUG CHARGE: active_navigations={ {k: type(k) for k in active_navigations.keys()} }")
+    if mission_id in active_navigations:
+        active_navigations[mission_id].battery_percentage = 100.0
+        return {"status": "success", "message": "UAV Battery recharged to 100%."}
+    raise HTTPException(status_code=404, detail="No active flight simulation found to charge.")
