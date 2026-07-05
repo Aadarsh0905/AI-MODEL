@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: eos-postgres-postgis
+    environment:
+      POSTGRES_DB: eos_db
+      POSTGRES_USER: eos_user
+      POSTGRES_PASSWORD: eos_password_secure
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: eos-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    restart: always
+
+  backend:
+    build: ./backend
+    container_name: eos-backend
+    environment:
+      - DATABASE_URL=postgresql://eos_user:eos_password_secure@db:5432/eos_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - STORAGE_DIR=/workspace/storage
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend-storage:/workspace/storage
+    depends_on:
+      - db
+      - redis
+    restart: always
+
+  frontend:
+    build: ./frontend
+    container_name: eos-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: always
+
+volumes:
+  pgdata:
+  redisdata:
+  backend-storage:
