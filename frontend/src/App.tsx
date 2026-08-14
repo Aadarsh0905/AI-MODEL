@@ -14,8 +14,17 @@ import { MapViewer } from './components/MapViewer';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { AuthPortal } from './components/AuthPortal';
 
-const BACKEND_URL = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000/api/v1/telemetry/ws';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || (
+  window.location.hostname === 'localhost' 
+    ? 'http://localhost:8000' 
+    : window.location.origin.replace('-frontend', '-backend')
+);
+
+const WS_URL = import.meta.env.VITE_WS_URL || (
+  window.location.hostname === 'localhost'
+    ? 'ws://localhost:8000/api/v1/telemetry/ws'
+    : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host.replace('-frontend', '-backend')}/api/v1/telemetry/ws`
+);
 
 const MISSION_LOCATIONS = [
   {

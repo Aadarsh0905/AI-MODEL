@@ -1,0 +1,58 @@
+# Render Blueprint Specification for Earth Observation System (EOS)
+# Deploy the entire stack using Render Blueprints: https://render.com/docs/blueprints
+services:
+  # 1. FastAPI Backend API
+  - type: web
+    name: eos-backend
+    env: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: eos-db
+          property: connectionString
+      - key: REDIS_HOST
+        fromService:
+          type: redis
+          name: eos-redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          type: redis
+          name: eos-redis
+          property: port
+      - key: STORAGE_DIR
+        value: /workspace/storage
+    # Note: Render Free Plan does not support Persistent Disks.
+    # To persist uploaded/processed DEM rasters across restarts, upgrade to a paid instance
+    # and uncomment the disk configuration below:
+    # disk:
+    #   name: eos-storage
+    #   mountPath: /workspace/storage
+    #   sizeGB: 10
+
+  # 2. React + TypeScript Frontend
+  - type: web
+    name: eos-frontend
+    env: docker
+    dockerfilePath: frontend/Dockerfile
+    dockerContext: frontend
+    plan: free
+    envVars:
+      - key: VITE_BACKEND_URL
+        value: ""
+
+  # 3. Redis Instance
+  - type: redis
+    name: eos-redis
+    plan: free
+    ipAllowList: [] # Only allow internal network connections from within the blueprint
+
+databases:
+  # 4. Managed PostgreSQL Database
+  - name: eos-db
+    databaseName: eos_db
+    user: eos_user
+    plan: free
