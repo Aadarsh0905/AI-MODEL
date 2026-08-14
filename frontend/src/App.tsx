@@ -67,6 +67,7 @@ const MISSION_LOCATIONS = [
 
 export default function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
+  const [authError, setAuthError] = useState<string | null>(null);
   const [userProfile, setUserProfile] = useState<{ email: string; full_name: string; role: string } | null>(null);
   const [projectId, setProjectId] = useState<number | null>(null);
   const [missionId, setMissionId] = useState<number | null>(null);
@@ -184,6 +185,7 @@ export default function App() {
   useEffect(() => {
     const initSession = async () => {
       try {
+        setAuthError(null);
         const params = new URLSearchParams();
         params.append('username', 'admin@eos.org');
         params.append('password', 'admin123');
@@ -201,7 +203,9 @@ export default function App() {
 
         // Initialize Project
         await initProject(jwtToken);
-      } catch (err) {
+      } catch (err: any) {
+        console.error(err);
+        setAuthError('Connection to the backend API failed. Render Web Services on the free plan sleep after 15 minutes of inactivity and take about 1 minute to spin back up. Please wait a moment and click the retry button below.');
         setAlertMsg({ type: 'error', text: 'Auth link offline. Check if backend container is running.' });
       }
     };
@@ -520,8 +524,41 @@ export default function App() {
     return (
       <ThemeProvider theme={darkTheme}>
         <CssBaseline />
-        <Box sx={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0c0f17' }}>
-          <CircularProgress sx={{ color: '#00e5ff' }} />
+        <Box sx={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0c0f17', gap: 3, px: 2, textAlign: 'center' }}>
+          {authError ? (
+            <Box sx={{ maxWidth: 450 }}>
+              <Typography variant="h6" color="error" sx={{ mb: 2, fontWeight: 'bold' }}>
+                Telemetry Connection Offline
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 3, lineHeight: 1.6 }}>
+                {authError}
+              </Typography>
+              <Button 
+                variant="contained" 
+                onClick={() => {
+                  setAuthError(null);
+                  window.location.reload();
+                }}
+                sx={{ 
+                  background: 'linear-gradient(90deg, #00e5ff 0%, #00e676 100%)',
+                  fontWeight: 'bold',
+                  color: '#0c0f17',
+                  '&:hover': {
+                    filter: 'brightness(1.1)'
+                  }
+                }}
+              >
+                Retry Connection
+              </Button>
+            </Box>
+          ) : (
+            <>
+              <CircularProgress sx={{ color: '#00e5ff', mb: 2 }} />
+              <Typography variant="body2" color="text.secondary">
+                Establishing secure telemetry link...
+              </Typography>
+            </>
+          )}
         </Box>
       </ThemeProvider>
     );
